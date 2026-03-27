@@ -1,0 +1,16 @@
+# 忽略权重、缓存和数据
+qwen-vl-finetune/checkpoints/
+qwen-vl-finetune/huggingface_cache/
+qwen-vl-finetune/train_custom_50.json
+qwen-vl-finetune/train_custom.json
+qwen-vl-finetune/val_custom_50.json
+qwen-vl-finetune/val_custom.json
+simple_bev/checkpoints/
+
+# 忽略 Python 缓存
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+simple_bev/rgb_checkpoint.tar.gz
+*.tar.gz
+*.pth
