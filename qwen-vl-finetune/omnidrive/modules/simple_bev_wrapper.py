@@ -244,10 +244,10 @@ class SimpleBEVWrapper(nn.Module):
             intrins=intrins,
         )
 
-        print("param dtype:", next(self.model.parameters()).dtype)
-        print("imgs dtype:", imgs.dtype)
-        print("rgb_camXs dtype:", rgb_camXs.dtype)
-        print("cam0_T_camXs dtype:", cam0_T_camXs.dtype)
+        # print("param dtype:", next(self.model.parameters()).dtype)
+        # print("imgs dtype:", imgs.dtype)
+        # print("rgb_camXs dtype:", rgb_camXs.dtype)
+        # print("cam0_T_camXs dtype:", cam0_T_camXs.dtype)
 
         self._hooked_feat_bev = None
         with torch.cuda.amp.autocast(enabled=False):

@@ -131,7 +131,7 @@ deepspeed --include localhost:0,1 --master_port $MASTER_PORT train_omnidrive.py 
     --attn_implementation "sdpa" \
     --save_strategy "epoch" \
     --save_total_limit 2 \
-    --learning_rate 5e-6 \
+    --learning_rate 1e-5 \
     --warmup_ratio 0.03 \
     --logging_steps 1 \
     --gradient_checkpointing True \
@@ -162,14 +162,14 @@ deepspeed --include localhost:0,1 --master_port $MASTER_PORT train_omnidrive.py 
     --load_best_model_at_end True \
     --metric_for_best_model "val_avg_L2" \
     --greater_is_better False \
-    --num_train_epochs 3 \
+    --num_train_epochs 5 \
     --per_device_train_batch_size 2 \
     --per_device_eval_batch_size 2 \
     --gradient_accumulation_steps 8 \
     --attn_implementation "sdpa" \
     --save_strategy "epoch" \
     --save_total_limit 2 \
-    --learning_rate 2e-6 \
+    --learning_rate 1e-5 \
     --warmup_ratio 0.03 \
     --logging_steps 1 \
     --gradient_checkpointing True \

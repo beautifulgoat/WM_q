@@ -28,15 +28,18 @@ def warp_bev_features(feat_src, pose_dst, pose_src, pc_range=[-51.2, -51.2, 51.2
 
     grid = F.affine_grid(affine_matrix, feat_src.size(), align_corners=False)
     warped_feat = F.grid_sample(feat_src.float(), grid, mode='bilinear', padding_mode='zeros', align_corners=False)
-    
+
     return warped_feat.to(dtype)
 
 
 class ResWorldFutureFeatureExtractor(nn.Module):
-    def __init__(self, embed_dims=128, num_scenes=16):
+    def __init__(self, embed_dims=128, num_scenes=16,residual_fusion="single",residual_alpha=0.5,):
         super().__init__()
         self.embed_dims = embed_dims
         self.num_scenes = num_scenes
+        self.residual_fusion = residual_fusion
+        self.residual_alpha = float(residual_alpha)
+
 
         # 1. Fused BEV 的卷积融合器
         self.bev_fusion_conv = nn.Sequential(
@@ -59,6 +62,19 @@ class ResWorldFutureFeatureExtractor(nn.Module):
 
         # 4. 唯一共享的 TokenFuser
         self.tokenfuser = TokenFuser(num_scenes, embed_dims)
+
+    def set_residual_fusion(self, mode="single", alpha=None):
+        if mode not in {"single", "alpha"}:
+            raise ValueError(f"Unsupported residual_fusion mode: {mode}")
+        self.residual_fusion = mode
+        if alpha is not None:
+            self.residual_alpha = float(alpha)
+
+    def _get_pos_embed(self, B, H, W, device, dtype):
+        pos = self.pos_embed.to(device=device, dtype=dtype)
+        pos = F.interpolate(pos, size=(H, W), mode="bilinear", align_corners=False)
+        pos = pos.expand(B, -1, -1, -1).reshape(B, self.embed_dims, H * W).permute(0, 2, 1)
+        return pos.contiguous()
 
     def forward(self, feat_t0, feat_t1, feat_t2, pose_t0=None, pose_t1=None, pose_t2=None):
         # --- 设备与精度同步防御 ---
@@ -87,46 +103,36 @@ class ResWorldFutureFeatureExtractor(nn.Module):
         # --- 第二步：生成 Fused BEV Feature (底层图) ---
         multi_frame_cat = torch.cat([feat_t0, aligned_feat_t1, aligned_feat_t2], dim=1) 
         fused_bev_feat = self.bev_fusion_conv(multi_frame_cat)
-        flat_fused = fused_bev_feat.view(B, C, N).permute(0, 2, 1)
 
         # --- 第三步：绝对对齐原论文！利用共享 TokenLearner 提取 ---
         # 展平单帧特征
-        flat_t0 = feat_t0.view(B, C, N).permute(0, 2, 1)
-        flat_t1 = aligned_feat_t1.view(B, C, N).permute(0, 2, 1)
-        flat_t2 = aligned_feat_t2.view(B, C, N).permute(0, 2, 1)
-
-        # 把 3 帧特征在 Batch 维度(dim=0)叠起来，变成 [3*B, N, C]
-        all_frames_flat = torch.cat([flat_t0, flat_t1, flat_t2], dim=0) 
-        
+        flat_fused = fused_bev_feat.view(B, C, N).permute(0, 2, 1).contiguous()
+        flat_t0 = feat_t0.view(B, C, N).permute(0, 2, 1).contiguous()
+        flat_t1 = aligned_feat_t1.view(B, C, N).permute(0, 2, 1).contiguous()
+        flat_t2 = aligned_feat_t2.view(B, C, N).permute(0, 2, 1).contiguous()
+       
         # 扩展位置编码并拼接
-        pos = self.pos_embed.to(device=active_device, dtype=active_dtype).expand(B * 3, -1, H, W).reshape(B * 3, C, N).permute(0, 2, 1)
-        all_queries = torch.cat([all_frames_flat, pos], dim=-1) # [3*B, N, 2*C]
+        pos = self._get_pos_embed(B, H, W, active_device, active_dtype)
+        fused_queries = torch.cat([flat_fused, pos], dim=-1) 
 
-        # 🚨 送入【唯一参数】的 TokenLearner！
-        _, all_selected_masks = self.res_tokenlearner(all_queries)
-        
-        # 用提取出的 Mask 获取对应的 Token
-        all_tokens = torch.einsum('bsn,bnc->bsc', all_selected_masks, all_frames_flat) # [3*B, 16, C]
+        _, shared_selected_masks = self.res_tokenlearner(fused_queries)  # [B, S, HW]
+        shared_selected_masks = shared_selected_masks.to(dtype=flat_fused.dtype)
 
         # 从 Batch 维度拆分回 3 帧独立的 Token
-        tokens_t0, tokens_t1, tokens_t2 = torch.chunk(all_tokens, 3, dim=0) # 每个都是 [B, 16, C]
+        tokens_t0 = torch.einsum('bsn,bnc->bsc', shared_selected_masks, flat_t0)
+        tokens_t1 = torch.einsum('bsn,bnc->bsc', shared_selected_masks, flat_t1)
+        tokens_t2 = torch.einsum('bsn,bnc->bsc', shared_selected_masks, flat_t2)
 
         # --- 第四步：时序残差相减 ---
         res_01 = tokens_t0 - tokens_t1
-        res_12 = tokens_t1 - tokens_t2
+        refined_res_01 = self.res_latent_decoder(res_01)
 
-        # --- 第五步：绝对对齐原论文！残差的独立 Self-Attention ---
-        # 🚨 必须在 Batch 维度拼接！不能在 Sequence 维度拼接！
-        res_both = torch.cat([res_01, res_12], dim=0) # 变成 [2*B, 16, C]
-        
-        # 此时送入 TransformerEncoder，它是对 2*B 个独立的样本，分别做 16 个 Token 内部的自注意力！
-        refined_both = self.res_latent_decoder(res_both)
-
-        # 拆分回两个强化后的残差
-        refined_res_01, refined_res_12 = torch.chunk(refined_both, 2, dim=0) # 每个都是 [B, 16, C]
-
-        # 将两个时序阶段的残差相加融合，提炼出统一的运动趋势
-        final_residual = refined_res_01 + refined_res_12
+        if self.residual_fusion == "alpha":
+            res_12 = tokens_t1 - tokens_t2
+            refined_res_12 = self.res_latent_decoder(res_12)
+            final_residual = refined_res_01 + self.residual_alpha * refined_res_12
+        else:
+            final_residual = refined_res_01
 
         # --- 第六步：融回 Fused BEV 生成 Future BEV Feature ---
         fused_flat_final = self.tokenfuser(final_residual, flat_fused) + flat_fused

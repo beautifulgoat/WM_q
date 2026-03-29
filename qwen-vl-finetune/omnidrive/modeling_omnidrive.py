@@ -103,7 +103,7 @@ class OmniDriveVLA(Qwen2_5_VLForConditionalGeneration):
         self.vision_token_id = getattr(config.vision_config, 'vision_token_id', 151655)
         # Fallback to hardcoded ID if not in config, matching your collator logic
         self.action_query_token_id = getattr(config, "action_query_token_id", 151665)
-
+        self.bev_injection_mode = "current_only"  # "current_only" | "all_frames"
         # 5. Initialization
         self.post_init()
         self._check_and_reset_nan_weights()
@@ -137,11 +137,46 @@ class OmniDriveVLA(Qwen2_5_VLForConditionalGeneration):
         )
         self.resworld_extractor = ResWorldFutureFeatureExtractor(
             embed_dims=128,   # 你 SimpleBEV 的通道数
-            num_scenes=16     # ResWorld 原论文的稀疏 Token 数
+            num_scenes=16,
+            residual_fusion="single",
+            residual_alpha=0.5,    
         )
         self.bev_injector.to(device=self.device, dtype=self.dtype)
         self.resworld_extractor.to(device=self.device, dtype=self.dtype)
         print("✅ Simple-BEV sidecar & BEV Injector initialized.")
+
+    def set_bev_injection_mode(self, mode: str = "current_only"):
+        if mode not in {"current_only", "all_frames"}:
+            raise ValueError(f"Unsupported bev injection mode: {mode}")
+        self.bev_injection_mode = mode
+
+    def _build_current_frame_img_mask(self, input_ids: torch.LongTensor) -> torch.BoolTensor:
+        """
+        当前数据集里 3 张图顺序是: T-2, T-1, Current(T)。
+        Qwen 展开后，每张图通常对应一段连续的 vision tokens，中间夹着文本 token。
+        因此这里取最后一段连续 vision token block，作为 Current(T) 的注入位置。
+        """
+        vision_mask = (input_ids == self.vision_token_id)
+        current_mask = torch.zeros_like(vision_mask, dtype=torch.bool)
+
+        for b in range(input_ids.shape[0]):
+            vision_idx = torch.nonzero(vision_mask[b], as_tuple=False).flatten()
+            if vision_idx.numel() == 0:
+                continue
+
+            block_breaks = torch.where((vision_idx[1:] - vision_idx[:-1]) > 1)[0]
+            last_block_start = int(block_breaks[-1].item() + 1) if block_breaks.numel() > 0 else 0
+            current_idx = vision_idx[last_block_start:]
+            current_mask[b, current_idx] = True
+
+        return current_mask
+
+    def _build_bev_injection_mask(self, input_ids: torch.LongTensor) -> torch.BoolTensor:
+        if self.bev_injection_mode == "all_frames":
+            return (input_ids == self.vision_token_id)
+        if self.bev_injection_mode == "current_only":
+            return self._build_current_frame_img_mask(input_ids)
+        raise ValueError(f"Unsupported bev injection mode: {self.bev_injection_mode}")
 
     # =========================================================================
     # Main Forward Pass
@@ -173,8 +208,6 @@ class OmniDriveVLA(Qwen2_5_VLForConditionalGeneration):
 
         # 1. Embedding Injection (Action Query)
         inputs_embeds = self._inject_query_embeddings(input_ids, batch_size)
-
-
         bev_imgs = kwargs.pop("bev_imgs", None)
         bev_rots = kwargs.pop("bev_rots", None)
         bev_trans = kwargs.pop("bev_trans", None)
@@ -189,13 +222,6 @@ class OmniDriveVLA(Qwen2_5_VLForConditionalGeneration):
                 bev_intrins=bev_intrins,
                 bev_ego_pose=bev_ego_pose,
             )
-        
-        print(simple_bev_out["bev_feat_t2"].shape)
-        print(simple_bev_out["bev_feat_t1"].shape)
-        print(simple_bev_out["bev_feat_t0"].shape)
-
-
-
         if simple_bev_out is not None and getattr(self, "bev_injector", None) is not None:
             
             # ---> 新增：加工特征 <---
@@ -204,9 +230,6 @@ class OmniDriveVLA(Qwen2_5_VLForConditionalGeneration):
             pose_t2 = pose_seq[:, 0] if pose_seq is not None else None
             pose_t1 = pose_seq[:, 1] if pose_seq is not None else None
             pose_t0 = pose_seq[:, 2] if pose_seq is not None else None
-            print(f"pose_t2: {pose_t2}")
-            print(f"pose_t1: {pose_t1}")
-            print(f"pose_t0: {pose_t0.shape}")
             # 送入我们写的黑盒，吐出神装 Future BEV Feature
             future_bev_feature = self.resworld_extractor(
                 feat_t0=simple_bev_out["bev_feat_t0"],
@@ -217,7 +240,7 @@ class OmniDriveVLA(Qwen2_5_VLForConditionalGeneration):
                 pose_t2=pose_t2                        # 🚨 加上 t2 位姿
             )
 
-            img_mask = (input_ids == self.vision_token_id)
+            img_mask = self._build_bev_injection_mask(input_ids)
             # 假设你注入的是当前帧 t0 的特征
             self.bev_injector.set_bev_context(future_bev_feature, img_mask)
         else:

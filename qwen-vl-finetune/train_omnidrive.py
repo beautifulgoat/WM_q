@@ -231,6 +231,131 @@ def print_gpu_status(step_name=""):
         print(f"📊 [GPU] {step_name}: Allocated {allocated:.2f} GB")
 
 
+def set_trainable_stage3_new_modules_only(model):
+    """
+    Stage 3:
+    - 冻结 LLM / Action Head / World Model / Visual Tower / Simple-BEV
+    - 只训练新增的 BEV 注入与 ResWorld 提取模块
+    """
+    print("🧩 [Stage 3 Freeze] Training ONLY bev_injector + resworld_extractor...")
+
+    # 先全冻
+    for _, p in model.named_parameters():
+        p.requires_grad = False
+
+    # 明确冻结这些模块
+    if hasattr(model, "model"):
+        model.model.requires_grad_(False)
+        if hasattr(model.model, "visual"):
+            model.model.visual.requires_grad_(False)
+            model.model.visual.eval()
+            print("❄️ Vision Tower Frozen.")
+        model.model.eval()
+
+    if hasattr(model, "action_head"):
+        model.action_head.requires_grad_(False)
+        model.action_head.eval()
+
+    if hasattr(model, "world_model"):
+        model.world_model.requires_grad_(False)
+        model.world_model.eval()
+
+    if hasattr(model, "semantic_projector"):
+        model.semantic_projector.requires_grad_(False)
+        model.semantic_projector.eval()
+
+    if hasattr(model, "proprio_projector"):
+        model.proprio_projector.requires_grad_(False)
+
+    if hasattr(model, "intent_predictor"):
+        model.intent_predictor.requires_grad_(False)
+
+    if hasattr(model, "action_query_embeddings"):
+        model.action_query_embeddings.requires_grad = False
+
+    # 外挂 Simple-BEV sidecar 默认就是 frozen=True
+    if hasattr(model, "simple_bev_sidecar") and model.simple_bev_sidecar is not None:
+        for p in model.simple_bev_sidecar.parameters():
+            p.requires_grad = False
+        model.simple_bev_sidecar.eval()
+        print("❄️ Simple-BEV sidecar Frozen.")
+
+    # 只打开新增模块
+    if hasattr(model, "bev_injector"):
+        model.bev_injector.requires_grad_(True)
+        model.bev_injector.train()
+        print("✅ BEV Injector Trainable.")
+
+    if hasattr(model, "resworld_extractor"):
+        model.resworld_extractor.requires_grad_(True)
+        model.resworld_extractor.train()
+        print("✅ ResWorld Extractor Trainable.")
+
+
+def set_trainable_stage4_joint_finetune(model):
+    """
+    Stage 4:
+    - 冻结 World Model / Visual Tower / Simple-BEV
+    - 解冻 LLM + Action Head + 相关投影层 + 新增的注入模块，联合微调
+    """
+    print("🚀 [Stage 4 Freeze] Joint finetune LLM + action head + BEV modules...")
+
+    # 先全冻
+    for _, p in model.named_parameters():
+        p.requires_grad = False
+
+    # 解冻 LLM backbone（语言主干）
+    if hasattr(model, "model"):
+        model.model.requires_grad_(True)
+        model.model.train()
+
+        if hasattr(model.model, "visual"):
+            model.model.visual.requires_grad_(False)
+            model.model.visual.eval()
+            print("❄️ Vision Tower Frozen.")
+
+    # 动作相关模块解冻
+    if hasattr(model, "action_head"):
+        model.action_head.requires_grad_(True)
+        model.action_head.train()
+
+    if hasattr(model, "proprio_projector"):
+        model.proprio_projector.requires_grad_(True)
+
+    if hasattr(model, "semantic_projector"):
+        model.semantic_projector.requires_grad_(True)
+        model.semantic_projector.train()
+
+    if hasattr(model, "intent_predictor"):
+        model.intent_predictor.requires_grad_(True)
+        model.intent_predictor.train()
+
+    if hasattr(model, "action_query_embeddings"):
+        model.action_query_embeddings.requires_grad = True
+
+    # 新增模块继续训练
+    if hasattr(model, "bev_injector"):
+        model.bev_injector.requires_grad_(True)
+        model.bev_injector.train()
+
+    if hasattr(model, "resworld_extractor"):
+        model.resworld_extractor.requires_grad_(True)
+        model.resworld_extractor.train()
+
+    # World Model 继续冻结
+    if hasattr(model, "world_model"):
+        model.world_model.requires_grad_(False)
+        model.world_model.eval()
+
+    # 外挂 Simple-BEV sidecar 继续冻结
+    if hasattr(model, "simple_bev_sidecar") and model.simple_bev_sidecar is not None:
+        for p in model.simple_bev_sidecar.parameters():
+            p.requires_grad = False
+        model.simple_bev_sidecar.eval()
+        print("❄️ Simple-BEV sidecar Frozen.")
+
+
+
 # ==============================================================================
 # 3. 自定义 Trainer
 # ==============================================================================
@@ -484,16 +609,16 @@ def train():
         nuclear_reset_action_head(model)
 
     elif data_args.stage == "stage3":
-        print("🧩 [Stage 3 Setup] Simple-BEV warmup/debug stage.")
+        print("🧩 [Stage 3 Setup] Train ONLY newly added BEV modules.")
         print("   > Load from Stage 2 checkpoint")
         print("   > NO action head reset")
-        print("   > Only LLM is trainable for now")
+        print("   > Trainable: bev_injector + resworld_extractor")
 
     elif data_args.stage == "stage4":
-        print("🧩 [Stage 4 Setup] Simple-BEV follow-up stage.")
+        print("🧩 [Stage 4 Setup] Joint finetune after BEV warmup.")
         print("   > Load from Stage 3 checkpoint")
         print("   > NO action head reset")
-        print("   > Only LLM is trainable for now")
+        print("   > Trainable: LLM + action_head + projectors + bev_injector + resworld_extractor")
 
     else:
         raise ValueError(f"Unsupported stage: {data_args.stage}")
@@ -530,8 +655,11 @@ def train():
         model.action_head.requires_grad_(True)
         model.semantic_projector.requires_grad_(True)
 
-    elif data_args.stage in ["stage3", "stage4"]:
-        set_trainable_only_llm(model)
+    elif data_args.stage == "stage3":
+        set_trainable_stage3_new_modules_only(model)
+
+    elif data_args.stage == "stage4":
+        set_trainable_stage4_joint_finetune(model)
     # =================================================================
     # 🛑 Gradient Checkpointing
     # =================================================================
